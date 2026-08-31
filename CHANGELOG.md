@@ -2,6 +2,109 @@
 
 All notable changes to fors33-scanner are documented here.
 
+## [v0.9.1] - 2026-08-21
+
+### Added
+
+- **GitHub Action** docs in README (`uses: fors33-official/fors33-scanner@v0.9.1`). Scan on the runner; no file uploads to Fors33.
+
+### Changed
+
+- Action image pin: `ghcr.io/fors33-official/fors33-scanner:v0.9.1` (matches publish workflow GHCR org).
+- Operator-visible CLI banners, argparse, and Action name: **Fors33 Scanner**.
+- Human report `[REFERENCE]` is `fors33.com` only.
+
+## [v0.9.0] - 2026-08-14
+
+### Added
+
+- **Cooperative cancel**: optional `should_cancel=` on `scan_roots`, `execute_scan`, and walk/hash helpers; raises `ScanCancelled` (same padding as the L3dgr Stop path).
+- **`has_sidecar` walk wiring**: unverified samples set `has_sidecar` when a skip-ext sibling exists but did not confer attestation (for example `.blake3` with `recognize_blake3_sidecar=False`). `execute_scan` preserves the flag when merging walk rows.
+
+### Changed
+
+- **`--tsa-url` help**: `FORS33_TSA_URL` is for downstream seal tooling; the scanner does not request timestamps.
+- **PyPI authors**: `Fors33` (env names `FORS33_*` unchanged).
+
+## [v0.8.4] - 2026-07-02
+
+### Fixed
+
+- **`execute_scan` baseline for single-file roots**: `wants_baseline=True` now routes file roots through `_scan_single_file` candidate collection instead of `_walk_and_collect` (which returned zero candidates for file paths).
+- **`_compute_baseline`**: threads `recognize_blake3_sidecar`, `below_threshold_single_file_counts_skipped`, and `strict_audit` for API consistency with `execute_scan`.
+
+## [v0.8.3] - 2026-07-02
+
+### Changed
+
+- **Unified release semver**: All release surfaces use `vX.Y.Z` — `pyproject.toml`, CHANGELOG, Git tags, PyPI, `workflow_dispatch` `version`, and Docker image tags (`:vX.Y.Z`). Bare `X.Y.Z` is rejected on Docker publish workflows.
+- **Publish workflows**: `publish-fors33-scanner` requires dispatch input `vX.Y.Z` and fails on bare semver.
+
+## [v0.8.2] - 2026-07-02
+
+### Added
+
+- **BagIt scan alignment** with L3dgr extension: shared `manifest_core` helpers; payload members under BagIt `data/` count as attested during directory walks.
+- **`is_epoch_upload_companion_basename`** in `hash_core` (epoch bundle companion skips).
+
+## [v0.8.1] - 2026-05-10
+
+### Added
+
+- **`_resolve_scanner_compat_kwargs` / `_sidecar_suffix_tuples`**: optional pre-0.8.0 counter and sidecar-classification semantics.
+- **`--legacy-scanner-stats`** and **`FORS33_SCANNER_LEGACY_STATS`**: bundle **below-threshold single-file counts as `skipped_files`** and **ignore `.blake3` as external attestation**.
+- **`scan_roots`**, **`execute_scan`** (keyword-only): **`legacy_scanner_stats`**, **`below_threshold_single_file_counts_skipped`**, **`recognize_blake3_sidecar`** (discrete knobs; legacy bundle overrides when enabled).
+
+### Changed
+
+- **`_scan_dir`**, **`_walk_and_collect`**, **`_scan_single_file`**: thread **`recognize_blake3_sidecar`** for consistent BLAKE3 sidecar handling on directory and baseline walks.
+
+## [0.8.0] - 2026-05-10
+
+### Added
+
+- **`_scan_single_file`**: Single-file roots use the same classification path as the Docker extension (stat with **`follow_symlinks=False`**, **`os.scandir`** + **`is_file(follow_symlinks=False)`** for sibling discovery, skip when the scan root basename is itself a sidecar suffix).
+- **`.blake3` sidecars**: Included in **`_ATT_EXTS`** so BLAKE3 sibling files count as external attestation coverage (README already listed `.blake3`).
+
+### Changed
+
+- **`scan_roots`**: File roots route through **`_scan_single_file`** instead of only directory walks.
+- **`execute_scan`**: Single-file baseline and stats paths delegate to **`_scan_single_file`**; below-threshold files no longer increment **`skipped_files`** (silent return, extension-style).
+- **Single-file `stat`**: Uses **`follow_symlinks=False`** for the target file; directory traversal still follows symlinks when **`--follow-symlinks`** is set.
+
+## [0.7.1] - 2026-05-10
+
+### Added
+
+- **`ScanStats.add_unverified_sample(..., *, has_sidecar=False)`**: Each unverified sample dict now includes `has_sidecar` as `"true"` or `"false"` for downstream re-seal UX (matches extension record shape).
+
+### Changed
+
+- **Docker publish workflow**: Buildx `sbom: true` and `provenance: mode=max` on versioned and `:latest` pushes; `id-token: write` for attestations.
+
+### Security
+
+- Supply chain: OCI SBOM and SLSA provenance attachments on GHCR/Docker Hub images from the publish workflow.
+
+## [0.7.0] - 2026-05-01
+
+### Added
+
+- **Single-file scanning**: Scanner now accepts individual file paths in addition to directories, enabling direct scanning of specific files without directory traversal.
+- **Sidecar parity**: Single-file mode recognizes all attestation sidecar extensions (`.f33`, `.sig`, `.asc`, `.sha256`, `.sha512`, `.blake3`, `.md5`, `.pem`) for behavioral parity with directory scanning.
+- **Baseline generation support**: Single-file scanning works with all baseline output formats (--emit-checksums, --emit-csv, --emit-json, --emit-jsonl).
+
+### Changed
+
+- **execute_scan() routing**: Modified to check if each root is a file or directory using `os.path.isfile()`, routing to direct processing for files and existing traversal for directories.
+- **Zero-byte file handling**: Threshold check uses `>=` operator to correctly handle zero-byte files when threshold is 0.0 MB.
+- **Symlink handling**: Single-file mode follows symlinks by default (consistent with `--follow-symlinks` parameter), processing the target file.
+
+### Security
+
+- **Single-file error handling**: Wraps `os.stat()` calls in try...except OSError to handle permission denied gracefully, incrementing `skipped_files` instead of crashing.
+- **Strict audit mode**: Re-raises file access errors as `StrictAuditFatal` when `--strict-audit` is enabled for audit compliance.
+
 ## [0.6.0] - 2026-04-16
 
 ### Added
@@ -53,7 +156,7 @@ All notable changes to fors33-scanner are documented here.
 - When both `--emit-jsonl -` and `--json` are requested, JSONL stream takes precedence on `stdout`.
 - Depth calculation uses normalized cross-platform path handling for Windows/POSIX consistency.
 - Docker build flows moved to hardened multi-stage `python:3.13-alpine` model with pinned build tooling.
-- Publish workflow is manual `workflow_dispatch` only with explicit `version` and `push_latest` inputs.
+- Publish workflow is manual `workflow_dispatch` only with explicit `version` = `vX.Y.Z` and `push_latest` inputs (bare `X.Y.Z` rejected).
 
 ## [0.3.0] - 2026-03-10
 

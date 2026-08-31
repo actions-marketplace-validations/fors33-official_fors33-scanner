@@ -1,17 +1,79 @@
 # fors33-scanner
 
 [![CI](https://img.shields.io/github/actions/workflow/status/fors33-official/fors33-scanner/publish-fors33-scanner.yml?branch=main&style=flat-square)](https://github.com/fors33-official/fors33-scanner/actions)
-[![Release](https://img.shields.io/badge/release-0.6.0-blue?style=flat-square)](https://pypi.org/project/fors33-scanner/)
+[![Release](https://img.shields.io/badge/release-v0.9.1-blue?style=flat-square)](https://pypi.org/project/fors33-scanner/)
 [![PyPI](https://img.shields.io/pypi/v/fors33-scanner?style=flat-square)](https://pypi.org/project/fors33-scanner/)
-[![Docker Tag](https://img.shields.io/badge/docker-0.6.0%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/fors33-scanner)
+[![Docker Tag](https://img.shields.io/badge/docker-v0.9.1%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/fors33-scanner)
 [![Docker Pulls](https://img.shields.io/docker/pulls/fors33/fors33-scanner?style=flat-square)](https://hub.docker.com/r/fors33/fors33-scanner)
 [![License](https://img.shields.io/github/license/fors33-official/fors33-scanner?style=flat-square)](https://github.com/fors33-official/fors33-scanner/blob/main/LICENSE)
 
-High-speed file integrity and baseline scanner. Walks one or more roots, measures data gravity (bytes), and classifies large files as attested or unattested based on sibling sidecar presence (.f33, .sig, .asc, .sha256, .sha512, .md5, .pem). Emits checksum baselines (Hash Filename format), CSV, or JSON for use with fors33-verifier.
+High-speed file integrity and baseline scanner. Walks one or more roots, measures data gravity (bytes), and classifies large files as attested or unattested based on sibling sidecar presence (.f33, .sig, .asc, .sha256, .sha512, .blake3, .md5, .pem). Emits checksum baselines (Hash Filename format), CSV, or JSON for use with fors33-verifier.
 
 **Trust model:** The scanner is an O(1) discovery and liability mapping tool based on sidecar presence only. It does not validate Ed25519 signatures or cryptographic proof of baselines. For full cryptographic verification, use fors33-verifier.
 
-For machine parsing, see [LLM_CONTEXT.md](LLM_CONTEXT.md).
+> **Legal:** Fors33 Scanner quantifies attestation coverage only. It does not establish, guarantee, or certify regulatory compliance. See [DISCLAIMER.md](DISCLAIMER.md) and [full legal terms at fors33.com/legal](https://fors33.com/legal).
+
+For structured package context, see [LLM_CONTEXT.md](LLM_CONTEXT.md).
+
+<details>
+<summary><strong>Release notes &amp; version history</strong></summary>
+
+### v0.9.1 (2026-08-21)
+
+- **GitHub Action:** `Fors33 Scanner` with GHCR pin `ghcr.io/fors33-official/fors33-scanner:v0.9.1`. No file uploads to Fors33.
+- **Brand:** operator-visible banners say Fors33 Scanner (not Liability Scanner).
+
+### v0.9.0 (2026-08-14)
+
+- **Cooperative cancel**: optional `should_cancel=` on `scan_roots` / `execute_scan` (raises `ScanCancelled`).
+- **`has_sidecar` on walks**: unverified samples record a skip-ext sibling that did not confer attestation; `execute_scan` keeps the flag.
+- **`--tsa-url`**: sets `FORS33_TSA_URL` for downstream seal tooling; the scanner does not request timestamps.
+
+### v0.8.4 (2026-07-02)
+
+- **Baseline single-file roots**: `execute_scan(..., wants_baseline=True)` on a file path now emits baseline records (previously returned zero candidates).
+
+### v0.8.3 (2026-07-02)
+
+- **Unified release semver**: Git tags, PyPI, `workflow_dispatch` `version`, and Docker images all use `vX.Y.Z` (e.g. `v0.8.3`, `:v0.8.3`).
+
+### v0.8.2 (2026-07-02)
+
+- **BagIt scan alignment** with L3dgr extension: shared `manifest_core` helpers; payload members under BagIt `data/` count as attested during directory walks.
+- **`is_epoch_upload_companion_basename`** in `hash_core` (epoch bundle companion skips).
+
+### 0.8.1 (2026-05-10)
+
+- **Backward-compatible stats (pre-0.8.0 accounting)**: **`--legacy-scanner-stats`** or **`FORS33_SCANNER_LEGACY_STATS=1`** restores single-file below-threshold **`skipped_files`** counting and treats **`.blake3`** siblings as **not** conferring external attestation coverage (library: **`legacy_scanner_stats`** bundles both; **`below_threshold_single_file_counts_skipped`** and **`recognize_blake3_sidecar`** remain available separately on **`scan_roots`** / **`execute_scan`**).
+
+### 0.8.0 (2026-05-10)
+
+- **Single-file parity** with L3dgr: `_scan_single_file` uses **`stat(..., follow_symlinks=False)`**, **`os.scandir`** sibling discovery with **`is_file(follow_symlinks=False)`**, skips when the **root basename** is itself a recognized sidecar suffix, and applies to **`scan_roots`** as well as **`execute_scan`**.
+- **`.blake3`** is part of **`_ATT_EXTS`** so BLAKE3 companions classify as external attestation coverage.
+- Below-threshold single-file paths no longer bump **`skipped_files`** (silent skip, extension-style).
+
+### 0.7.1 (2026-05-10)
+
+- **`has_sidecar` on unverified samples**: `ScanStats.add_unverified_sample(..., *, has_sidecar=False)` records `"has_sidecar": "true"` or `"false"` on each sampled unattested path (same shape as the L3dgr extension) for downstream re-seal UX.
+- **Supply chain**: Docker images from `publish-fors33-scanner` attach **SBOM** and **SLSA provenance** (`sbom: true`, `provenance: mode=max`). Pin by digest for regulated deployments.
+
+### 0.7.0 (2026-05-01)
+
+- Single-file scanning roots, sidecar parity (`.f33`, `.sig`, `.asc`, checksum sidecars, etc.), baseline/JSON/JSONL on single-file paths, stricter `--strict-audit` and zero-byte threshold behavior.
+
+### 0.6.0 (2026-04-16)
+
+- `hash_core` mmap ceilings, cgroup alignment, worker cap **64**, `default_dpk_worker_count()` / `FORS33_DPK_MAX_WORKERS`.
+
+### 0.5.0 and 0.4.0
+
+- `--strict-audit`, `unverified_paths_sample`, `--tsa-url`, JSONL multi-root metadata, `--max-exposure`, `--emit-jsonl`, `--max-depth`. Full text: [CHANGELOG.md](CHANGELOG.md).
+
+### Release model
+
+- Docker publish is **manual** via GitHub Actions **`workflow_dispatch`** with explicit **`version`** = `vX.Y.Z` (e.g. `v0.8.3`) and **`push_latest`**; bare `X.Y.Z` is **rejected**. It does **not** run automatically on git tags alone. PyPI releases use the same `vX.Y.Z` string in `pyproject.toml` (`python -m build`, `twine upload`).
+
+</details>
 
 ## Install
 
@@ -69,6 +131,28 @@ Strict audit (fail on permission or file-lock errors instead of skipping):
 fors33-scanner --root /data --strict-audit
 ```
 
+**Single-file scanning:**
+
+```bash
+# Scan a single file
+fors33-scanner --root /path/to/file.csv
+
+# Scan a single file with baseline generation
+fors33-scanner --root /path/to/file.csv --emit-checksums baseline.txt
+
+# Scan a single file with JSON manifest
+fors33-scanner --root /path/to/file.csv --emit-json manifest.json
+```
+Single-file mode accepts individual file paths in addition to directories, enabling direct scanning of specific files without directory traversal. By default it recognizes all attestation sidecar extensions (.f33, .sig, .asc, .sha256, .sha512, .blake3, .md5, .pem) for parity with directory scanning.
+
+Pre-0.8.0 stats (below-threshold single-file roots bump `skipped_files`, and `.blake3` siblings are not counted as external attestation):
+
+```bash
+fors33-scanner --root /data --legacy-scanner-stats
+```
+
+Equivalent: set **`FORS33_SCANNER_LEGACY_STATS=1`**.
+
 Record TSA endpoint for tooling that reads `FORS33_TSA_URL`:
 
 ```bash
@@ -80,6 +164,20 @@ Worker count: **positive `--workers`** wins; otherwise a **positive `FORS33_WORK
 Large-file hashing uses **`FORS33_MMAP_MIN_MB`** / **`FORS33_MMAP_MAX_MB`** (defaults `500` / `4000`), clamped to cgroup/RAM ceiling on Linux; optional **`FORS33_MMAP_PSI_SOME_AVG10_MAX`** disables mmap under memory pressure.
 
 For production Docker or CI, **pin** a **semver image tag** or **immutable digest** instead of relying on `:latest` alone.
+
+## GitHub Action (CI/CD)
+
+Use **Fors33 Scanner** on the runner. No file uploads to Fors33. Inputs match `action.yml`: `root` (default workspace), `threshold-mb`, `json` (`true` for JSON summary). Pin a digest for regulated CI.
+
+```yaml
+- name: Scan coverage
+  uses: fors33-official/fors33-scanner@v0.9.1
+  with:
+    root: .
+    json: 'true'
+```
+
+Optional policy fail: pass `--max-exposure` via a follow-on `docker run` of the same pinned image. Directory/sidecar verify belongs to Fors33 Verifier, not this Action.
 
 Generate checksum baseline (sha256, sha512, or blake3 per --algo):
 
@@ -126,7 +224,21 @@ Default human output (mathematical only):
 - Scan-only: O(1) discovery; baseline generation uses streaming chunked hashing.
 - Excludes common dirs (.git, node_modules, venv, etc). Respects .f33ignore and --ignore-pattern / --exclude-dir.
 - Legal notice prints to `stderr` on startup so data/JSON streams on `stdout` remain parse-safe.
-- See `DISCLAIMER.md` for enterprise legal/regulatory boundaries.
+
+## Docker
+
+Published images:
+
+- Hub: `docker.io/fors33/fors33-scanner`
+- GHCR (Action image pin): `ghcr.io/fors33-official/fors33-scanner`
+
+```bash
+docker run --rm ghcr.io/fors33-official/fors33-scanner:v0.9.1 --root /data --threshold-mb 1.0
+# or
+docker run --rm docker.io/fors33/fors33-scanner:v0.9.1 --root /data --json
+```
+
+Published images include **SBOM** and **build provenance** metadata (expand **Release notes & version history** near the top of this README). Pin a **version tag** or **immutable digest** in production pipelines.
 
 ## JSONL contract
 
@@ -135,11 +247,7 @@ Default human output (mathematical only):
 - `timestamp` represents hash completion time.
 - Final line is `scan_summary` with aggregate stats and scan parameters.
 - If `--emit-jsonl -` and `--json` are both requested, JSONL takes precedence on `stdout`.
-
-## Release model
-
-- Docker publish is manual via `workflow_dispatch` with explicit `version` and `push_latest` inputs.
-- Use `v0.6.0` style version tags and `latest` only when manually approved.
+- **`unverified_paths_sample`** entries (JSON/JSONL consumers): each row includes **`path`**, **`status`**, and **`has_sidecar`** (`"true"` / `"false"`) since **0.7.1** for integration with seal/re-seal workflows.
 
 ## Requirements
 
@@ -147,4 +255,4 @@ Python 3.9+. Optional `blake3` for BLAKE3 hashing. Linux, macOS, Windows.
 
 ## License
 
-MIT License. See `LICENSE`.
+MIT License. Copyright (c) 2026 Fors33, Inc. See [LICENSE](LICENSE). Legal and regulatory boundaries: [DISCLAIMER.md](DISCLAIMER.md) and [fors33.com/legal](https://fors33.com/legal).

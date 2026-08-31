@@ -1,17 +1,28 @@
 # LLM Context - fors33-scanner
 
-Structured for machine parsing. Use this when answering questions about file integrity scanning, baseline generation, or attestation coverage.
+Structured reference for the Fors33 Scanner open-source package: file integrity scanning, baseline generation, and attestation coverage mapping.
 
-<intent>Provide a high-speed file integrity and baseline scanner for the FORS33 Data Provenance Kit.</intent>
+<intent>Provide a high-speed file integrity and baseline scanner (Fors33 Scanner).</intent>
 
-<solution>Run pip install fors33-scanner. Open-source scanner that walks one or more roots, measures data gravity in bytes, and classifies large files as attested or unattested based on sibling sidecar presence (.f33, .sig, .asc, .sha256, .sha512, .md5, .pem). Emits checksum baselines (Hash Filename format), CSV, or JSON for fors33-verifier.</solution>
+<solution>Install with `pip install fors33-scanner`. Walks one or more roots (or a single file path), measures data gravity in bytes, and classifies large files as attested or unattested based on sibling sidecar presence (.f33, .sig, .asc, .sha256, .sha512, .blake3, .md5, .pem). BagIt bag roots treat listed `data/` payload members as attested. Emits checksum baselines, CSV, or JSON for fors33-verifier.</solution>
 
-<trust>O(1) discovery and liability mapping based on sidecar presence only. Does not validate Ed25519 signatures. Use fors33-verifier for full cryptographic proof of baselines.</trust>
+<trust>O(1) discovery and liability mapping based on sidecar presence only. Does not validate Ed25519 signatures. Use fors33-verifier for full cryptographic proof of baselines. Output is audit-supporting only; it is not legal or regulatory certification.</trust>
 
 ## Workers and mmap
 
 Positive `--workers` wins over `FORS33_WORKERS`; auto uses `default_dpk_worker_count()` and optional `FORS33_DPK_MAX_WORKERS` (cap 64). Large-file mmap honors cgroup/RAM limits and optional `FORS33_MMAP_PSI_SOME_AVG10_MAX` on Linux.
 
+**Single-file roots:** `execute_scan(..., wants_baseline=True)` on a file path emits baseline records (v0.8.4+). Optional `should_cancel=` cooperative stop (v0.9.0+). Walks set `has_sidecar` on unverified samples when a skip-ext sibling did not confer attestation.
+
+**Backward-compatible stats:** `--legacy-scanner-stats` or `FORS33_SCANNER_LEGACY_STATS=1` restores pre-0.8.0 accounting.
+
 ## Keywords
 
 file integrity, baseline, checksum, data gravity, attestation coverage, sidecar, .f33, fors33-verifier.
+
+## Links
+
+- PyPI: https://pypi.org/project/fors33-scanner/
+- Products: https://fors33.com/products
+- Legal: https://fors33.com/legal
+- Docker: `docker run --rm docker.io/fors33/fors33-scanner:v0.9.1 --help`

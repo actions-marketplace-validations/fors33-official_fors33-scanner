@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag without leading v (example: 0.6.0)'
+        description: 'Version tag with leading v (example: v0.9.0). Bare X.Y.Z is rejected.'
         required: true
         type: string
       push_latest:
@@ -19,6 +19,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
 
     steps:
       - name: Checkout
@@ -30,6 +31,10 @@ jobs:
           VERSION="${{ inputs.version }}"
           if [ -z "$VERSION" ]; then
             echo "Version input is required."
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^v[0-9] ]]; then
+            echo "Version must be vX.Y.Z (leading v required). Got: $VERSION"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -63,6 +68,8 @@ jobs:
             docker.io/fors33/fors33-scanner:${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          sbom: true
+          provenance: mode=max
 
       - name: Build and push latest tags
         if: ${{ steps.meta.outputs.push_latest == 'true' }}
@@ -76,4 +83,16 @@ jobs:
             docker.io/fors33/fors33-scanner:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          sbom: true
+          provenance: mode=max
+
+      - name: Update Docker Hub repository description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: fors33/fors33-scanner
+          readme-filepath: ./README.md
+          enable-url-completion: true
+          short-description: High-speed liability scanner for attested vs unattested data using .f33 sidecars.
 

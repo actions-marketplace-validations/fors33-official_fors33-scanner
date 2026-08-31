@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FORS33 Liability Scanner (open source)
+Fors33 Scanner (open source)
 
 High-speed, read-only scanner that walks one or more roots using os.scandir,
 measures "data gravity" (bytes) for large files, and classifies them as
@@ -8,24 +8,58 @@ attested or unattested based on presence of a sibling .f33 sidecar.
 
 This module is standalone: no network calls, no telemetry. Designed for
 enterprise environments and CI pipelines.
+
+Large-tree runs rely on default_dpk_worker_count plus hash_core token-bucket
+throttling so the Docker extension UI stays responsive during background hashing.
 """
 from __future__ import annotations
 
 import argparse
 import csv
-from datetime import datetime, timezone
 import fnmatch
 import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict, field
 from typing import Callable, Dict, Iterable, List, Set
 
 try:
-    from .hash_core import default_dpk_worker_count, hash_file, path_for_kernel, path_from_kernel
+    from .hash_core import (
+        default_dpk_worker_count,
+        hash_file,
+        is_epoch_upload_companion_basename,
+        path_for_kernel,
+        path_from_kernel,
+    )
+    from .manifest_core import (
+        bagit_payload_relpaths,
+        discover_bagit_layout,
+        is_bagit_tag_basename,
+    )
 except ImportError:  # pragma: no cover - flat layout
-    from hash_core import default_dpk_worker_count, hash_file, path_for_kernel, path_from_kernel
+    from hash_core import (
+        default_dpk_worker_count,
+        hash_file,
+        is_epoch_upload_companion_basename,
+        path_for_kernel,
+        path_from_kernel,
+    )
+    from manifest_core import (
+        bagit_payload_relpaths,
+        discover_bagit_layout,
+        is_bagit_tag_basename,
+    )
+
+
+class ScanCancelled(RuntimeError):
+    """Operator cancelled an in-flight scan (cooperative stop)."""
+
+
+def _check_scan_cancel(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise ScanCancelled("Cancelled by operator")
 
 
 def _env_bool(key: str) -> bool:
@@ -52,6 +86,10 @@ def resolve_dpk_worker_count(cli_workers: int | None) -> int:
     return default_dpk_worker_count()
 
 
+def _default_worker_count() -> int:
+    return default_dpk_worker_count()
+
+
 _EXCLUDE_DIRS: Set[str] = {
     ".git",
     "node_modules",
@@ -62,10 +100,11 @@ _EXCLUDE_DIRS: Set[str] = {
     ".vscode",
 }
 
-# Recognized attestation sidecar extensions. .f33 is the deterministic FΦRS33
+# Recognized attestation sidecar extensions. .f33 is the deterministic Fors33
 # standard; the others are external/legacy formats we respect for coverage.
 _F33_EXT = ".f33"
-_ATT_EXTS = (
+_BLAKE3_EXT = ".blake3"
+_CORE_ATT_EXTS = (
     _F33_EXT,
     ".sig",
     ".asc",
@@ -74,15 +113,69 @@ _ATT_EXTS = (
     ".md5",
     ".pem",
 )
+_ATT_EXTS = _CORE_ATT_EXTS + (_BLAKE3_EXT,)
 _EXTERNAL_EXTS = tuple(ext for ext in _ATT_EXTS if ext != _F33_EXT)
 
+
+def _sidecar_suffix_tuples(
+    recognize_blake3_sidecar: bool = True,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return (skip_exts, external_attestation_exts) for directory/single-file walks."""
+    skip_exts = _CORE_ATT_EXTS + (_BLAKE3_EXT,)
+    external_exts = tuple(ext for ext in _CORE_ATT_EXTS if ext != _F33_EXT)
+    if recognize_blake3_sidecar:
+        external_exts = external_exts + (_BLAKE3_EXT,)
+    return skip_exts, external_exts
+
+
+def _skip_ext_sidecar_present(
+    name: str,
+    filenames: set[str],
+    skip_exts: tuple[str, ...],
+) -> bool:
+    """True when a skip-ext sibling exists (UI hint; does not confer attestation)."""
+    return any(f"{name}{ext}" in filenames for ext in skip_exts)
+
+
+def _resolve_scanner_compat_kwargs(
+    *,
+    legacy_scanner_stats: bool = False,
+    below_threshold_single_file_counts_skipped: bool = False,
+    recognize_blake3_sidecar: bool = True,
+) -> dict[str, bool]:
+    """Apply legacy bundle and env overrides for pre-0.8.0 scanner accounting."""
+    if legacy_scanner_stats or _env_bool("FORS33_SCANNER_LEGACY_STATS"):
+        below_threshold_single_file_counts_skipped = True
+        recognize_blake3_sidecar = False
+    return {
+        "below_threshold_single_file_counts_skipped": below_threshold_single_file_counts_skipped,
+        "recognize_blake3_sidecar": recognize_blake3_sidecar,
+    }
+
 LEGAL_BANNER_LINES = (
-    "[LEGAL]  FORS33 Liability Scanner",
+    "[LEGAL]  Fors33 Scanner",
     "[LEGAL]  This scanner quantifies attestation coverage only.",
     "[LEGAL]  Verify results in your chain-of-custody workflow.",
     "[LEGAL]  Do not treat summary output as cryptographic proof.",
+    "[LEGAL]  Full legal terms: https://fors33.com/legal",
     "[LEGAL]  Unauthorized use is prohibited.",
 )
+
+
+def _depth_from_root(root_path: str, current_path: str) -> int:
+    """
+    Compute traversal depth where:
+      - depth(root) == 0
+      - depth(root/child) == 1
+    Normalizes both paths to make dot-slash and slash/backslash cases stable.
+    """
+    root_np = os.path.normpath(os.path.abspath(path_from_kernel(root_path)))
+    cur_np = os.path.normpath(os.path.abspath(path_from_kernel(current_path)))
+    rel = os.path.relpath(cur_np, root_np)
+    rel_norm = rel.replace("\\", "/")
+    if rel_norm == ".":
+        return 0
+    return len(rel_norm.split("/"))
 
 
 class StrictAuditFatal(Exception):
@@ -102,7 +195,7 @@ def _is_strict_audit_io_error(exc: BaseException) -> bool:
 
 @dataclass
 class BaselineRecord:
-    """Unified record shape for Data Latch UI: path, digest, algo, bytes, mtime, status."""
+    """Unified record shape for L3dgr UI: path, digest, algo, bytes, mtime, status."""
 
     path: str
     digest: str
@@ -132,11 +225,25 @@ class ScanStats:
     mutated_during_scan: int = 0
     unverified_paths_sample: List[Dict[str, str]] = field(default_factory=list)
 
-    def add_unverified_sample(self, rel_path: str, status: str = "UNSEALED") -> None:
+    def add_unverified_sample(
+        self,
+        rel_path: str,
+        status: str = "UNSEALED",
+        *,
+        has_sidecar: bool = False,
+    ) -> None:
         if len(self.unverified_paths_sample) >= 300:
             return
+        # Wave 3B: ``has_sidecar`` lets the UI flag a re-seal candidate so the
+        # operator gets the 21 CFR §11.10(e) reason-for-change prompt before
+        # the seal request goes out. ``str("true")`` keeps the dict shape
+        # consistent with the existing ``path`` / ``status`` strings.
         self.unverified_paths_sample.append(
-            {"path": rel_path.replace("\\", "/"), "status": status}
+            {
+                "path": rel_path.replace("\\", "/"),
+                "status": status,
+                "has_sidecar": "true" if has_sidecar else "false",
+            }
         )
 
     @property
@@ -203,20 +310,29 @@ def _matches_ignore(rel_path: str, patterns: List[str]) -> bool:
     return False
 
 
-def _depth_from_root(root_path: str, current_path: str) -> int:
-    """
-    Compute traversal depth where:
-      - depth(root) == 0
-      - depth(root/child) == 1
-    Normalizes both paths to make dot-slash and slash/backslash cases stable.
-    """
-    root_np = os.path.normpath(os.path.abspath(path_from_kernel(root_path)))
-    cur_np = os.path.normpath(os.path.abspath(path_from_kernel(current_path)))
-    rel = os.path.relpath(cur_np, root_np)
-    rel_norm = rel.replace("\\", "/")
-    if rel_norm == ".":
-        return 0
-    return len(rel_norm.split("/"))
+def _bagit_attested_relpaths_for_root(root: str) -> Set[str] | None:
+    layout = discover_bagit_layout(root)
+    if not layout:
+        return None
+    return bagit_payload_relpaths(layout)
+
+
+def _bagit_context_for_file(file_path: str) -> tuple[Set[str] | None, str | None]:
+    """When file_path is inside a bag payload, return attested paths and bag root."""
+    abs_file = os.path.abspath(file_path)
+    probe = os.path.dirname(abs_file)
+    for _ in range(4):
+        layout = discover_bagit_layout(probe)
+        if layout:
+            rel = os.path.relpath(abs_file, layout.bag_root).replace("\\", "/")
+            paths = bagit_payload_relpaths(layout)
+            if rel in paths:
+                return paths, layout.bag_root
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return None, None
 
 
 def _scan_dir(
@@ -231,7 +347,11 @@ def _scan_dir(
     visited_files: Set[tuple[int, int]] | None = None,
     strict_audit: bool = False,
     max_depth: int | None = None,
+    bagit_attested_relpaths: Set[str] | None = None,
+    recognize_blake3_sidecar: bool = True,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> None:
+    skip_exts, external_exts = _sidecar_suffix_tuples(recognize_blake3_sidecar)
     try:
         st_dir = os.stat(path_for_kernel(path), follow_symlinks=False)
     except OSError as e:
@@ -259,6 +379,7 @@ def _scan_dir(
     }
 
     for entry in entries:
+        _check_scan_cancel(should_cancel)
         name = entry.name
         entry_path = entry.path
         if entry.is_dir(follow_symlinks=follow_symlinks):
@@ -281,13 +402,27 @@ def _scan_dir(
                 visited_files,
                 strict_audit=strict_audit,
                 max_depth=max_depth,
+                bagit_attested_relpaths=bagit_attested_relpaths,
+                recognize_blake3_sidecar=recognize_blake3_sidecar,
+                should_cancel=should_cancel,
             )
         elif entry.is_file(follow_symlinks=follow_symlinks):
             stats.files_scanned += 1
             # Skip sidecar files themselves; we classify their parents.
-            if any(name.endswith(ext) for ext in _ATT_EXTS):
+            if any(name.endswith(ext) for ext in skip_exts):
+                continue
+            if is_epoch_upload_companion_basename(name):
+                continue
+            if bagit_attested_relpaths is not None and is_bagit_tag_basename(name):
+                continue
+            if (
+                name.startswith("fors33-manifest")
+                and name.endswith(".json")
+                and not name.endswith(".lock")
+            ):
                 continue
             rel_path = os.path.relpath(path_from_kernel(entry_path), path_from_kernel(root))
+            norm_rel = rel_path.replace("\\", "/")
             if _matches_ignore(rel_path, ignore_patterns):
                 continue
             try:
@@ -314,12 +449,17 @@ def _scan_dir(
             has_f33 = f"{name}{_F33_EXT}" in filenames
             has_external = False
             if not has_f33:
-                for ext in _EXTERNAL_EXTS:
+                for ext in external_exts:
                     if f"{name}{ext}" in filenames:
                         has_external = True
                         break
 
-            if has_f33:
+            if bagit_attested_relpaths is not None and norm_rel in bagit_attested_relpaths:
+                stats.attested_files += 1
+                stats.attested_bytes += size
+                stats.attested_external_files += 1
+                stats.attested_external_bytes += size
+            elif has_f33:
                 stats.attested_files += 1
                 stats.attested_bytes += size
                 stats.attested_f33_files += 1
@@ -332,7 +472,115 @@ def _scan_dir(
             else:
                 stats.unattested_files += 1
                 stats.unattested_bytes += size
-                stats.add_unverified_sample(rel_path, "UNSEALED")
+                stats.add_unverified_sample(
+                    rel_path,
+                    "UNSEALED",
+                    has_sidecar=_skip_ext_sidecar_present(name, filenames, skip_exts),
+                )
+
+
+def _scan_single_file(
+    file_path: str,
+    root: str,
+    threshold_bytes: int,
+    stats: ScanStats,
+    ignore_patterns: List[str],
+    strict_audit: bool = False,
+    *,
+    below_threshold_single_file_counts_skipped: bool = False,
+    recognize_blake3_sidecar: bool = True,
+    baseline_candidate_out: List[tuple[str, str, int, float]] | None = None,
+) -> None:
+    """Scan a single file (not a directory)."""
+    skip_exts, external_exts = _sidecar_suffix_tuples(recognize_blake3_sidecar)
+    try:
+        st = os.stat(path_for_kernel(file_path), follow_symlinks=False)
+    except OSError as e:
+        if strict_audit and _is_strict_audit_io_error(e):
+            raise StrictAuditFatal(f"Inaccessible file (strict audit): {file_path}: {e}") from e
+        stats.skipped_files += 1
+        return
+
+    stats.files_scanned += 1
+    
+    # Skip sidecar files themselves; we classify their parents.
+    name = os.path.basename(file_path)
+    if any(name.endswith(ext) for ext in skip_exts):
+        return
+    if is_epoch_upload_companion_basename(name):
+        return
+    if name.startswith("fors33-manifest") and name.endswith(".json") and not name.endswith(".lock"):
+        return
+
+    rel_path = os.path.relpath(path_from_kernel(file_path), path_from_kernel(root))
+    # Same file as scan root: relpath is "."; evidence UI needs a stable display name.
+    if rel_path in (".", os.curdir) or rel_path == "":
+        rel_path = name.replace("\\", "/")
+    bagit_paths, bag_root = _bagit_context_for_file(file_path)
+    if bag_root:
+        rel_path = os.path.relpath(path_from_kernel(file_path), path_from_kernel(bag_root)).replace(
+            "\\", "/"
+        )
+    norm_rel = rel_path.replace("\\", "/")
+    if _matches_ignore(rel_path, ignore_patterns):
+        return
+    
+    size = st.st_size
+    if size < threshold_bytes:
+        if below_threshold_single_file_counts_skipped:
+            stats.skipped_files += 1
+        return
+
+    stats.candidate_files += 1
+    stats.total_bytes += size
+    if baseline_candidate_out is not None:
+        baseline_candidate_out.append((norm_rel, file_path, size, st.st_mtime))
+
+    # For single file, check for sidecar in same directory
+    dir_path = os.path.dirname(file_path)
+    try:
+        with os.scandir(path_for_kernel(dir_path)) as it:
+            entries = list(it)
+    except (PermissionError, FileNotFoundError, NotADirectoryError, OSError) as e:
+        if strict_audit and _is_strict_audit_io_error(e):
+            raise StrictAuditFatal(f"Inaccessible directory (strict audit): {dir_path}: {e}") from e
+        return
+
+    filenames = {
+        entry.name for entry in entries if entry.is_file(follow_symlinks=False)
+    }
+
+    has_f33 = f"{name}{_F33_EXT}" in filenames
+    has_external = False
+    if not has_f33:
+        for ext in external_exts:
+            if f"{name}{ext}" in filenames:
+                has_external = True
+                break
+
+    if bagit_paths is not None and norm_rel in bagit_paths:
+        stats.attested_files += 1
+        stats.attested_bytes += size
+        stats.attested_external_files += 1
+        stats.attested_external_bytes += size
+    elif has_f33:
+        stats.attested_files += 1
+        stats.attested_bytes += size
+        stats.attested_f33_files += 1
+        stats.attested_f33_bytes += size
+    elif has_external:
+        stats.attested_files += 1
+        stats.attested_bytes += size
+        stats.attested_external_files += 1
+        stats.attested_external_bytes += size
+    else:
+        stats.unattested_files += 1
+        stats.unattested_bytes += size
+        stats.add_unverified_sample(
+            rel_path,
+            "UNSEALED",
+            has_sidecar=_skip_ext_sidecar_present(name, filenames, skip_exts),
+        )
 
 
 def scan_roots(
@@ -343,7 +591,19 @@ def scan_roots(
     follow_symlinks: bool = False,
     strict_audit: bool = False,
     max_depth: int | None = None,
+    *,
+    legacy_scanner_stats: bool = False,
+    below_threshold_single_file_counts_skipped: bool = False,
+    recognize_blake3_sidecar: bool = True,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> ScanStats:
+    compat = _resolve_scanner_compat_kwargs(
+        legacy_scanner_stats=legacy_scanner_stats,
+        below_threshold_single_file_counts_skipped=below_threshold_single_file_counts_skipped,
+        recognize_blake3_sidecar=recognize_blake3_sidecar,
+    )
+    below_skip = compat["below_threshold_single_file_counts_skipped"]
+    recognize_blake3 = compat["recognize_blake3_sidecar"]
     norm_roots = [os.path.abspath(r) for r in (list(roots) or [os.getcwd()])]
     stats = ScanStats(roots=norm_roots)
     threshold_bytes = int(threshold_mb * 1024 * 1024)
@@ -353,21 +613,42 @@ def scan_roots(
     base_ignore_patterns: List[str] = list(ignore_patterns or [])
 
     for root in norm_roots:
+        _check_scan_cancel(should_cancel)
         root_patterns = base_ignore_patterns + _load_f33ignore_patterns(root)
         visited_dirs: Set[tuple[int, int]] = set()
-        _scan_dir(
-            root,
-            root,
-            threshold_bytes,
-            stats,
-            root_patterns,
-            extra_exclude_dirs,
-            follow_symlinks,
-            visited_dirs,
-            set() if follow_symlinks else None,
-            strict_audit=strict_audit,
-            max_depth=max_depth,
-        )
+        
+        # Check if root is a file or directory
+        if os.path.isfile(path_for_kernel(root)):
+            # Handle single file case
+            _scan_single_file(
+                root,
+                root,
+                threshold_bytes,
+                stats,
+                root_patterns,
+                strict_audit=strict_audit,
+                below_threshold_single_file_counts_skipped=below_skip,
+                recognize_blake3_sidecar=recognize_blake3,
+            )
+        else:
+            # Handle directory case
+            bagit_paths = _bagit_attested_relpaths_for_root(root)
+            _scan_dir(
+                root,
+                root,
+                threshold_bytes,
+                stats,
+                root_patterns,
+                extra_exclude_dirs,
+                follow_symlinks,
+                visited_dirs,
+                set() if follow_symlinks else None,
+                strict_audit=strict_audit,
+                max_depth=max_depth,
+                bagit_attested_relpaths=bagit_paths,
+                recognize_blake3_sidecar=recognize_blake3,
+                should_cancel=should_cancel,
+            )
 
     stats.elapsed_seconds = time.time() - start
     return stats
@@ -381,13 +662,20 @@ def _walk_and_collect(
     follow_symlinks: bool,
     strict_audit: bool = False,
     max_depth: int | None = None,
+    *,
+    recognize_blake3_sidecar: bool = True,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[ScanStats, List[tuple[str, str, int, float]]]:
     """
     Single directory walk that collects scan stats and candidate files for baseline.
     Returns (stats, candidates). No second os.walk; skipped_files counted once.
     """
+    skip_exts, external_exts = _sidecar_suffix_tuples(recognize_blake3_sidecar)
+    from concurrent.futures import ThreadPoolExecutor
+
     root_abs = os.path.abspath(root)
     stats = ScanStats(roots=[root_abs])
+    bagit_attested_relpaths = _bagit_attested_relpaths_for_root(root_abs)
     visited_dirs: Set[tuple[int, int]] = set()
     visited_files: Set[tuple[int, int]] = set()
     candidates: List[tuple[str, str, int, float]] = []
@@ -395,6 +683,7 @@ def _walk_and_collect(
     walk_root = path_for_kernel(root_abs)
 
     for dirpath, dirnames, filenames in os.walk(walk_root, followlinks=follow_symlinks):
+        _check_scan_cancel(should_cancel)
         try:
             st_dir = os.stat(path_for_kernel(dirpath), follow_symlinks=False)
         except OSError as e:
@@ -420,7 +709,17 @@ def _walk_and_collect(
                 dirnames[:] = []
         filenames_set = set(filenames)
         for name in filenames:
-            if any(name.endswith(ext) for ext in _ATT_EXTS):
+            if any(name.endswith(ext) for ext in skip_exts):
+                continue
+            if is_epoch_upload_companion_basename(name):
+                continue
+            if bagit_attested_relpaths is not None and is_bagit_tag_basename(name):
+                continue
+            if (
+                name.startswith("fors33-manifest")
+                and name.endswith(".json")
+                and not name.endswith(".lock")
+            ):
                 continue
             full_path = os.path.join(dirpath, name)
             rel_path = os.path.relpath(path_from_kernel(full_path), path_from_kernel(root_abs))
@@ -449,9 +748,14 @@ def _walk_and_collect(
             stats.total_bytes += size
             has_f33 = f"{name}{_F33_EXT}" in filenames_set
             has_external = not has_f33 and any(
-                f"{name}{ext}" in filenames_set for ext in _EXTERNAL_EXTS
+                f"{name}{ext}" in filenames_set for ext in external_exts
             )
-            if has_f33:
+            if bagit_attested_relpaths is not None and norm_rel in bagit_attested_relpaths:
+                stats.attested_external_files += 1
+                stats.attested_external_bytes += size
+                stats.attested_files += 1
+                stats.attested_bytes += size
+            elif has_f33:
                 stats.attested_f33_files += 1
                 stats.attested_f33_bytes += size
                 stats.attested_files += 1
@@ -464,7 +768,11 @@ def _walk_and_collect(
             else:
                 stats.unattested_files += 1
                 stats.unattested_bytes += size
-                stats.add_unverified_sample(norm_rel, "UNSEALED")
+                stats.add_unverified_sample(
+                    norm_rel,
+                    "UNSEALED",
+                    has_sidecar=_skip_ext_sidecar_present(name, filenames_set, skip_exts),
+                )
             candidates.append((norm_rel, full_path, size, st.st_mtime))
 
     stats.elapsed_seconds = time.time() - start
@@ -477,21 +785,11 @@ def _hash_candidates(
     follow_symlinks: bool,
     stats: ScanStats,
     progress_event_callback: Callable[[dict], None] | None = None,
-    max_workers: int | None = None,
-    root_paths: List[str] | None = None,
-    record_event_callback: Callable[[dict], None] | None = None,
 ) -> List[Dict[str, object]]:
     """Hash candidate files (single root) and return baseline records."""
     root_indexed = [(0, rel, fp, sz, mt) for rel, fp, sz, mt in candidates]
     return _hash_candidates_multi(
-        root_indexed,
-        algo,
-        follow_symlinks,
-        stats,
-        progress_event_callback,
-        max_workers=max_workers,
-        root_paths=root_paths or [],
-        record_event_callback=record_event_callback,
+        root_indexed, algo, follow_symlinks, stats, progress_event_callback
     )
 
 
@@ -502,17 +800,16 @@ def _hash_candidates_multi(
     stats: ScanStats,
     progress_event_callback: Callable[[dict], None] | None = None,
     max_workers: int | None = None,
-    root_paths: List[str] | None = None,
-    record_event_callback: Callable[[dict], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> List[Dict[str, object]]:
     """Hash candidate files (multi-root) and return baseline records; update stats.skipped_files and mutated_during_scan."""
     from concurrent.futures import ThreadPoolExecutor
 
     records: List[Dict[str, object]] = []
     effective_workers = resolve_dpk_worker_count(max_workers)
-    root_paths = root_paths or []
 
     def _worker(item: tuple[int, str, str, int, float]):
+        _check_scan_cancel(should_cancel)
         root_idx, rel, full_path, size, _mtime = item
         try:
             st_before = os.stat(path_for_kernel(full_path), follow_symlinks=follow_symlinks)
@@ -553,17 +850,17 @@ def _hash_candidates_multi(
             )
             mutated = before_key != after_key
             mtime_final = st_after.st_mtime
-            completed_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         except Exception as e:
             print(f"[ERROR] Unhandled worker exception: {e}", file=sys.stderr)
-            return (root_idx, rel, size, 0.0, None, True, False, "")
-        return (root_idx, rel, size, mtime_final, digest, False, mutated, completed_ts)
+            return (root_idx, rel, size, 0.0, None, True, False)
+        return (root_idx, rel, size, mtime_final, digest, False, mutated)
 
     executor = ThreadPoolExecutor(max_workers=effective_workers)
     try:
-        for root_idx, rel, size, mtime_final, digest, skipped, mutated, completed_ts in executor.map(
+        for root_idx, rel, size, mtime_final, digest, skipped, mutated in executor.map(
             _worker, candidates
         ):
+            _check_scan_cancel(should_cancel)
             if skipped:
                 stats.skipped_files += 1
                 continue
@@ -579,25 +876,8 @@ def _hash_candidates_multi(
                     "mtime": int(mtime_final),
                     "root_index": root_idx,
                     "status": "baseline",
-                    "completed_at": completed_ts,
                 }
             )
-            if record_event_callback is not None:
-                root_path = root_paths[root_idx] if root_idx < len(root_paths) else ""
-                record_event_callback(
-                    {
-                        "timestamp": completed_ts,
-                        "event_type": "scan_record",
-                        "path": rel,
-                        "algo": algo,
-                        "digest": digest.lower() if isinstance(digest, str) else "",
-                        "bytes": size,
-                        "mtime": int(mtime_final),
-                        "status": "baseline",
-                        "root_index": root_idx,
-                        "root_path": root_path,
-                    }
-                )
     except KeyboardInterrupt:
         executor.shutdown(wait=False, cancel_futures=True)
         sys.exit(130)
@@ -614,10 +894,10 @@ def _compute_baseline(
     stats: ScanStats | None = None,
     ignore_patterns: List[str] | None = None,
     exclude_dirs: Set[str] | None = None,
-    max_workers: int | None = None,
-    max_depth: int | None = None,
+    *,
+    recognize_blake3_sidecar: bool = True,
+    below_threshold_single_file_counts_skipped: bool = False,
     strict_audit: bool = False,
-    record_event_callback: Callable[[dict], None] | None = None,
 ) -> List[Dict[str, object]]:
     """
     Walk a single root and compute baseline records for all candidate files.
@@ -625,60 +905,58 @@ def _compute_baseline(
     """
     extra_exclude = exclude_dirs or set()
     ignore_list = ignore_patterns or []
-    if stats is not None:
+    root_abs = os.path.abspath(root)
+
+    def _merge_walk_stats(target: ScanStats, walk_stats: ScanStats) -> None:
+        target.files_scanned = walk_stats.files_scanned
+        target.candidate_files = walk_stats.candidate_files
+        target.total_bytes = walk_stats.total_bytes
+        target.attested_files = walk_stats.attested_files
+        target.attested_bytes = walk_stats.attested_bytes
+        target.unattested_files = walk_stats.unattested_files
+        target.unattested_bytes = walk_stats.unattested_bytes
+        target.attested_f33_files = walk_stats.attested_f33_files
+        target.attested_f33_bytes = walk_stats.attested_f33_bytes
+        target.attested_external_files = walk_stats.attested_external_files
+        target.attested_external_bytes = walk_stats.attested_external_bytes
+        target.skipped_files = walk_stats.skipped_files
+        target.elapsed_seconds = walk_stats.elapsed_seconds
+
+    if os.path.isfile(path_for_kernel(root_abs)):
+        walk_stats = ScanStats(roots=[root_abs])
+        file_candidates: List[tuple[str, str, int, float]] = []
+        _scan_single_file(
+            root_abs,
+            root_abs,
+            threshold_bytes,
+            walk_stats,
+            ignore_list,
+            strict_audit=strict_audit,
+            below_threshold_single_file_counts_skipped=below_threshold_single_file_counts_skipped,
+            recognize_blake3_sidecar=recognize_blake3_sidecar,
+            baseline_candidate_out=file_candidates,
+        )
+        candidates = file_candidates
+    else:
         walk_stats, candidates = _walk_and_collect(
-            root,
+            root_abs,
             threshold_bytes,
             ignore_list,
             extra_exclude,
             follow_symlinks,
             strict_audit=strict_audit,
-            max_depth=max_depth,
+            recognize_blake3_sidecar=recognize_blake3_sidecar,
         )
-        stats.files_scanned = walk_stats.files_scanned
-        stats.candidate_files = walk_stats.candidate_files
-        stats.total_bytes = walk_stats.total_bytes
-        stats.attested_files = walk_stats.attested_files
-        stats.attested_bytes = walk_stats.attested_bytes
-        stats.unattested_files = walk_stats.unattested_files
-        stats.unattested_bytes = walk_stats.unattested_bytes
-        stats.attested_f33_files = walk_stats.attested_f33_files
-        stats.attested_f33_bytes = walk_stats.attested_f33_bytes
-        stats.attested_external_files = walk_stats.attested_external_files
-        stats.attested_external_bytes = walk_stats.attested_external_bytes
-        stats.skipped_files = walk_stats.skipped_files
-        stats.elapsed_seconds = walk_stats.elapsed_seconds
-        for row in walk_stats.unverified_paths_sample:
-            stats.add_unverified_sample(row["path"], row.get("status", "UNSEALED"))
+
+    if stats is not None:
+        _merge_walk_stats(stats, walk_stats)
         return _hash_candidates(
-            candidates,
-            algo,
-            follow_symlinks,
-            stats,
-            progress_event_callback=None,
-            max_workers=max_workers,
-            root_paths=[os.path.abspath(root)],
-            record_event_callback=record_event_callback,
+            candidates, algo, follow_symlinks, stats, progress_event_callback=None
         )
-    stats_placeholder = ScanStats(roots=[os.path.abspath(root)])
-    _, candidates = _walk_and_collect(
-        root,
-        threshold_bytes,
-        ignore_list,
-        extra_exclude,
-        follow_symlinks,
-        strict_audit=strict_audit,
-        max_depth=max_depth,
-    )
+    stats_placeholder = ScanStats(roots=[root_abs])
+    _merge_walk_stats(stats_placeholder, walk_stats)
     return _hash_candidates(
-        candidates,
-        algo,
-        follow_symlinks,
-        stats_placeholder,
-        progress_event_callback=None,
-        max_workers=max_workers,
-        root_paths=[os.path.abspath(root)],
-        record_event_callback=record_event_callback,
+        candidates, algo, follow_symlinks, stats_placeholder, progress_event_callback=None
     )
 
 
@@ -695,7 +973,11 @@ def execute_scan(
     strict_audit: bool = False,
     max_depth: int | None = None,
     max_workers: int | None = None,
-    record_event_callback: Callable[[dict], None] | None = None,
+    *,
+    legacy_scanner_stats: bool = False,
+    below_threshold_single_file_counts_skipped: bool = False,
+    recognize_blake3_sidecar: bool = True,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[ScanStats, List[Dict[str, object]]]:
     """
     Library entry point: scan roots and optionally compute baseline.
@@ -709,22 +991,48 @@ def execute_scan(
     threshold_bytes = int(threshold_mb * 1024 * 1024)
     base_ignore = list(ignore_patterns or [])
     exclude_set = set(exclude_dirs or [])
+    compat = _resolve_scanner_compat_kwargs(
+        legacy_scanner_stats=legacy_scanner_stats,
+        below_threshold_single_file_counts_skipped=below_threshold_single_file_counts_skipped,
+        recognize_blake3_sidecar=recognize_blake3_sidecar,
+    )
+    recognize_blake3 = compat["recognize_blake3_sidecar"]
+    below_skip = compat["below_threshold_single_file_counts_skipped"]
 
     if wants_baseline:
         all_candidates: List[tuple[int, str, str, int, float]] = []
         stats = ScanStats(roots=roots_abs)
         baseline_start = time.time()
         for root_idx, root in enumerate(roots_abs):
+            _check_scan_cancel(should_cancel)
             root_ignore = base_ignore + _load_f33ignore_patterns(root)
-            walk_stats, candidates = _walk_and_collect(
-                root,
-                threshold_bytes,
-                root_ignore,
-                exclude_set,
-                follow_symlinks,
-                strict_audit=strict_audit,
-                max_depth=max_depth,
-            )
+            if os.path.isfile(path_for_kernel(root)):
+                walk_stats = ScanStats(roots=[root])
+                file_candidates: List[tuple[str, str, int, float]] = []
+                _scan_single_file(
+                    root,
+                    root,
+                    threshold_bytes,
+                    walk_stats,
+                    root_ignore,
+                    strict_audit=strict_audit,
+                    below_threshold_single_file_counts_skipped=below_skip,
+                    recognize_blake3_sidecar=recognize_blake3,
+                    baseline_candidate_out=file_candidates,
+                )
+                candidates = file_candidates
+            else:
+                walk_stats, candidates = _walk_and_collect(
+                    root,
+                    threshold_bytes,
+                    root_ignore,
+                    exclude_set,
+                    follow_symlinks,
+                    strict_audit=strict_audit,
+                    max_depth=max_depth,
+                    recognize_blake3_sidecar=recognize_blake3,
+                    should_cancel=should_cancel,
+                )
             stats.files_scanned += walk_stats.files_scanned
             stats.candidate_files += walk_stats.candidate_files
             stats.total_bytes += walk_stats.total_bytes
@@ -738,7 +1046,11 @@ def execute_scan(
             stats.attested_external_bytes += walk_stats.attested_external_bytes
             stats.skipped_files += walk_stats.skipped_files
             for row in walk_stats.unverified_paths_sample:
-                stats.add_unverified_sample(row["path"], row.get("status", "UNSEALED"))
+                stats.add_unverified_sample(
+                    row["path"],
+                    row.get("status", "UNSEALED"),
+                    has_sidecar=str(row.get("has_sidecar", "false")).lower() == "true",
+                )
             for norm_rel, full_path, size, mtime in candidates:
                 all_candidates.append((root_idx, norm_rel, full_path, size, mtime))
         stats.elapsed_seconds = time.time() - baseline_start
@@ -749,8 +1061,7 @@ def execute_scan(
             stats,
             progress_event_callback,
             max_workers=max_workers,
-            root_paths=roots_abs,
-            record_event_callback=record_event_callback,
+            should_cancel=should_cancel,
         )
     else:
         stats = scan_roots(
@@ -761,6 +1072,12 @@ def execute_scan(
             follow_symlinks=follow_symlinks,
             strict_audit=strict_audit,
             max_depth=max_depth,
+            legacy_scanner_stats=legacy_scanner_stats,
+            below_threshold_single_file_counts_skipped=compat[
+                "below_threshold_single_file_counts_skipped"
+            ],
+            recognize_blake3_sidecar=recognize_blake3,
+            should_cancel=should_cancel,
         )
         records = []
     return stats, records
@@ -847,23 +1164,22 @@ def print_human_report(stats: ScanStats, compliance_report: bool = False) -> Non
     print(f"[EXPOSURE RISK] : {exposure_pct:.1f}% volume exposed to silent mutation")
     print(f"[SEVERITY]      : {risk}")
     print(
-        "[COMPLIANCE]    : Fails SEC 17a-4 (WORM) and ESMA chain-of-custody controls"
+        "[COMPLIANCE]    : High exposure; map results to your retention and chain-of-custody policy"
     )
     print(
         "[REMEDIATION]   : Enforce deterministic attestation on exposed directories."
     )
     print(
-        "[REFERENCE]     : fors33.com | GitHub Marketplace: FORS33"
+        "[REFERENCE]     : fors33.com"
     )
 
 
 def main() -> None:
     for line in LEGAL_BANNER_LINES:
         print(line, file=sys.stderr)
-
     parser = argparse.ArgumentParser(
         description=(
-            "FORS33 Liability Scanner: quantify attested vs unattested data bytes "
+            "Fors33 Scanner: quantify attested vs unattested data bytes "
             "using .f33 sidecars."
         )
     )
@@ -883,6 +1199,27 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--max-exposure",
+        type=float,
+        help="Exit 1 if exposure ratio exceeds threshold (0.0 to 1.0).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Override default thread worker count (hard capped at 64).",
+    )
+    parser.add_argument(
+        "--emit-jsonl",
+        metavar="PATH",
+        dest="emit_jsonl_path",
+        help="Emit SIEM-ready JSONL stream. Use '-' for stdout.",
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        help="Limit traversal depth (0=root, 1=root+children).",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit JSON summary to stdout instead of human-readable report.",
@@ -890,7 +1227,7 @@ def main() -> None:
     parser.add_argument(
         "--compliance-report",
         action="store_true",
-        help="Include SEC/ESMA exposure, severity, and remediation text in human output.",
+        help="Include exposure, severity tier, and remediation hints in human-readable output.",
     )
     parser.add_argument(
         "--emit-checksums",
@@ -939,6 +1276,14 @@ def main() -> None:
         help="Follow directory symlinks during scans with basic loop detection.",
     )
     parser.add_argument(
+        "--legacy-scanner-stats",
+        action="store_true",
+        help=(
+            "Restore pre-0.8.0 accounting: below-threshold single-file roots count as "
+            "skipped_files; .blake3 siblings do not confer external attestation."
+        ),
+    )
+    parser.add_argument(
         "--algo",
         choices=["sha256", "sha512", "blake3", "md5", "sha1"],
         default="sha256",
@@ -951,39 +1296,10 @@ def main() -> None:
         help="Strip this prefix from roots and paths in stored/logged/JSON output (e.g. Docker host-mount).",
     )
     parser.add_argument(
-        "--max-exposure",
-        type=float,
-        default=None,
-        help="Fail with exit code 1 when exposure percentage exceeds this threshold (0-100).",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=None,
-        help="Override hashing thread count (hard capped at 64; <=0 uses auto default).",
-    )
-    parser.add_argument(
-        "--max-depth",
-        type=int,
-        default=None,
-        help="Maximum traversal depth where 0=root only, 1=root+direct children.",
-    )
-    parser.add_argument(
-        "--emit-jsonl",
-        metavar="PATH",
-        dest="emit_jsonl_path",
-        help="Write JSONL baseline events (scan_record + scan_summary). Use '-' for stdout.",
-    )
-    parser.add_argument(
         "--tsa-url",
         default=None,
         metavar="URL",
-        help="RFC 3161 TSA endpoint; sets FORS33_TSA_URL for seal-sidecar timestamp requests.",
-    )
-    parser.add_argument(
-        "--strict-audit",
-        action="store_true",
-        help="Fail fast on permission or locking errors instead of skipping paths.",
+        help="Explicit RFC 3161 TSA endpoint override; sets FORS33_TSA_URL for downstream seal tooling. The scanner does not request timestamps.",
     )
     args = parser.parse_args()
 
@@ -998,6 +1314,16 @@ def main() -> None:
             args.threshold_mb = float(os.environ["FORS33_THRESHOLD_MB"].strip())
         except ValueError:
             pass
+    if os.environ.get("FORS33_MAX_EXPOSURE"):
+        try:
+            args.max_exposure = float(os.environ["FORS33_MAX_EXPOSURE"].strip())
+        except ValueError:
+            pass
+    if os.environ.get("FORS33_MAX_DEPTH"):
+        try:
+            args.max_depth = int(os.environ["FORS33_MAX_DEPTH"].strip())
+        except ValueError:
+            pass
     if os.environ.get("FORS33_ROOT"):
         args.root = [os.environ["FORS33_ROOT"].strip()] if not args.root else args.root
     if _env_bool("FORS33_FOLLOW_SYMLINKS"):
@@ -1008,18 +1334,6 @@ def main() -> None:
     if os.environ.get("FORS33_EXCLUDE_DIR"):
         dirs = [d.strip() for d in os.environ["FORS33_EXCLUDE_DIR"].split(",") if d.strip()]
         args.exclude_dir = list(args.exclude_dir or []) + dirs
-    if os.environ.get("FORS33_MAX_EXPOSURE"):
-        try:
-            args.max_exposure = float(os.environ["FORS33_MAX_EXPOSURE"].strip())
-        except ValueError:
-            print("[ERROR] FORS33_MAX_EXPOSURE must be a float.", file=sys.stderr)
-            sys.exit(2)
-    if os.environ.get("FORS33_MAX_DEPTH"):
-        try:
-            args.max_depth = int(os.environ["FORS33_MAX_DEPTH"].strip())
-        except ValueError:
-            print("[ERROR] FORS33_MAX_DEPTH must be an integer.", file=sys.stderr)
-            sys.exit(2)
 
     roots = args.root or [os.getcwd()]
     emit_checksums_path = args.emit_checksums_path
@@ -1028,12 +1342,11 @@ def main() -> None:
     emit_jsonl_path = args.emit_jsonl_path
     wants_baseline = bool(emit_checksums_path or emit_csv or emit_json_path or emit_jsonl_path)
 
-    if args.max_exposure is not None and not (0.0 <= args.max_exposure <= 100.0):
-        print("[ERROR] --max-exposure must be between 0 and 100.", file=sys.stderr)
-        sys.exit(2)
-    if args.max_depth is not None and args.max_depth < 0:
-        print("[ERROR] --max-depth must be >= 0.", file=sys.stderr)
-        sys.exit(2)
+    try:
+        effective_workers = resolve_dpk_worker_count(args.workers)
+    except ValueError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return
 
     if args.algo == "blake3":
         try:
@@ -1053,49 +1366,22 @@ def main() -> None:
             "[ERROR] --emit-checksums and --emit-csv support a single --root only.",
             file=sys.stderr,
         )
-        sys.exit(2)
+        return
 
-    try:
-        effective_workers = resolve_dpk_worker_count(args.workers)
-    except ValueError as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
-        sys.exit(2)
-
-    jsonl_stream = None
-    jsonl_should_close = False
-    if emit_jsonl_path:
-        if emit_jsonl_path == "-":
-            jsonl_stream = sys.stdout
-        else:
-            jsonl_stream = open(emit_jsonl_path, "w", encoding="utf-8")
-            jsonl_should_close = True
-
-    def _emit_jsonl_event(event: dict) -> None:
-        if jsonl_stream is None:
-            return
-        json.dump(event, jsonl_stream)
-        jsonl_stream.write("\n")
-        jsonl_stream.flush()
-
-    try:
-        stats, records = execute_scan(
-            roots=roots,
-            threshold_mb=args.threshold_mb,
-            ignore_patterns=args.ignore_pattern,
-            exclude_dirs=args.exclude_dir,
-            follow_symlinks=args.follow_symlinks,
-            algo=args.algo,
-            wants_baseline=wants_baseline,
-            progress_event_callback=None,
-            strip_mount_prefix=args.strip_mount_prefix or "",
-            strict_audit=args.strict_audit,
-            max_depth=args.max_depth,
-            max_workers=effective_workers,
-            record_event_callback=_emit_jsonl_event if jsonl_stream is not None else None,
-        )
-    except StrictAuditFatal as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
-        sys.exit(2)
+    stats, records = execute_scan(
+        roots=roots,
+        threshold_mb=args.threshold_mb,
+        ignore_patterns=args.ignore_pattern,
+        exclude_dirs=args.exclude_dir,
+        follow_symlinks=args.follow_symlinks,
+        algo=args.algo,
+        wants_baseline=wants_baseline,
+        progress_event_callback=None,
+        strip_mount_prefix=args.strip_mount_prefix or "",
+        max_depth=args.max_depth,
+        max_workers=effective_workers,
+        legacy_scanner_stats=args.legacy_scanner_stats,
+    )
     roots_abs = stats.roots
 
     stdout_is_payload = any(
@@ -1103,6 +1389,78 @@ def main() -> None:
         for p in (emit_checksums_path, emit_csv, emit_json_path, emit_jsonl_path)
         if p is not None
     )
+
+    # JSONL output: SIEM-ready stream with per-file scan_record and terminal scan_summary.
+    if emit_jsonl_path:
+        dest = sys.stdout if emit_jsonl_path == "-" else open(
+            emit_jsonl_path, "w", encoding="utf-8"
+        )
+        try:
+            for rec in records:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                root_idx = int(rec.get("root_index", 0))
+                root_path_raw = roots_abs[root_idx] if 0 <= root_idx < len(roots_abs) else roots_abs[0]
+                dest.write(
+                    json.dumps(
+                        {
+                            "timestamp": ts,
+                            "event_type": "scan_record",
+                            "path": rec["path"],
+                            "algo": rec["algo"],
+                            "digest": rec["digest"],
+                            "bytes": rec["bytes"],
+                            "mtime": rec["mtime"],
+                            "status": rec.get("status", "baseline"),
+                            "root_index": root_idx,
+                            "root_path": _strip_mount_prefix(
+                                root_path_raw, args.strip_mount_prefix or ""
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            summary = {
+                "timestamp": ts,
+                "event_type": "scan_summary",
+                "files_scanned": stats.files_scanned,
+                "candidate_files": stats.candidate_files,
+                "attested_files": stats.attested_files,
+                "unattested_files": stats.unattested_files,
+                "total_bytes": stats.total_bytes,
+                "attested_bytes": stats.attested_bytes,
+                "unattested_bytes": stats.unattested_bytes,
+                "attested_f33_files": stats.attested_f33_files,
+                "attested_external_files": stats.attested_external_files,
+                "attested_f33_bytes": stats.attested_f33_bytes,
+                "attested_external_bytes": stats.attested_external_bytes,
+                "skipped_files": stats.skipped_files,
+                "mutated_during_scan": stats.mutated_during_scan,
+                "exposure_ratio": stats.exposure_ratio,
+                "risk_level": stats.risk_level,
+                "threshold_mb": args.threshold_mb,
+                "algo": args.algo,
+                "workers": effective_workers,
+                "max_depth": args.max_depth,
+            }
+            dest.write(json.dumps(summary) + "\n")
+        finally:
+            if dest is not sys.stdout:
+                dest.close()
+
+    # Exit code contract: mutated forces exit 1; max-exposure breach forces exit 1.
+    exit_code = 1 if stats.mutated_during_scan > 0 else 0
+    if (
+        args.max_exposure is not None
+        and stats.total_bytes > 0
+        and stats.exposure_ratio > args.max_exposure
+    ):
+        print(
+            f"[ERROR] Exposure ratio {stats.exposure_ratio:.3f} exceeds maximum threshold of {args.max_exposure}",
+            file=sys.stderr,
+        )
+        exit_code = 1
 
     if wants_baseline:
 
@@ -1132,48 +1490,10 @@ def main() -> None:
                         records, roots_abs, args.algo, f,
                         stats=stats, strip_mount_prefix=args.strip_mount_prefix or "",
                     )
-        if emit_jsonl_path:
-            summary_event = {
-                "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-                "event_type": "scan_summary",
-                "files_scanned": stats.files_scanned,
-                "candidate_files": stats.candidate_files,
-                "attested_files": stats.attested_files,
-                "unattested_files": stats.unattested_files,
-                "total_bytes": stats.total_bytes,
-                "attested_bytes": stats.attested_bytes,
-                "unattested_bytes": stats.unattested_bytes,
-                "attested_f33_files": stats.attested_f33_files,
-                "attested_external_files": stats.attested_external_files,
-                "attested_f33_bytes": stats.attested_f33_bytes,
-                "attested_external_bytes": stats.attested_external_bytes,
-                "exposure_ratio": stats.exposure_ratio,
-                "risk_level": stats.risk_level,
-                "elapsed_seconds": stats.elapsed_seconds,
-                "skipped_files": stats.skipped_files,
-                "mutated_during_scan": stats.mutated_during_scan,
-                "roots": roots_abs,
-                "threshold_mb": args.threshold_mb,
-                "algo": args.algo,
-                "workers": effective_workers,
-                "max_depth": args.max_depth,
-            }
-            _emit_jsonl_event(summary_event)
-
-    if jsonl_should_close and jsonl_stream is not None:
-        jsonl_stream.close()
-
-    exposure_pct = stats.exposure_ratio * 100.0 if stats.total_bytes > 0 else 0.0
-    if args.max_exposure is not None and stats.total_bytes > 0 and exposure_pct > args.max_exposure:
-        print(
-            f"[ERROR] Exposure threshold breached: {exposure_pct:.2f}% > {args.max_exposure:.2f}%",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     # Summary output: respect existing --json behavior, but avoid polluting stdout when
     # it has been used for baseline payloads.
-    if args.json and not stdout_is_payload and not (emit_jsonl_path == "-"):
+    if args.json and not stdout_is_payload:
         payload = asdict(stats)
         payload.update(
             {
@@ -1182,10 +1502,10 @@ def main() -> None:
             }
         )
         print(json.dumps(payload))
-        return
-
-    if not args.json and not stdout_is_payload:
+    elif not args.json and not stdout_is_payload:
         print_human_report(stats, compliance_report=args.compliance_report)
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
