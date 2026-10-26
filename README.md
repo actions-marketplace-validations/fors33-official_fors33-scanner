@@ -1,9 +1,10 @@
 # fors33-scanner
 
 [![CI](https://img.shields.io/github/actions/workflow/status/fors33-official/fors33-scanner/publish-fors33-scanner.yml?branch=main&style=flat-square)](https://github.com/fors33-official/fors33-scanner/actions)
-[![Release](https://img.shields.io/badge/release-v0.9.1-blue?style=flat-square)](https://pypi.org/project/fors33-scanner/)
+[![publish-pypi](https://img.shields.io/github/actions/workflow/status/fors33-official/fors33-scanner/publish-pypi.yml?label=publish-pypi&style=flat-square)](https://github.com/fors33-official/fors33-scanner/actions/workflows/publish-pypi.yml)
+[![Release](https://img.shields.io/badge/release-v0.10.1-blue?style=flat-square)](https://pypi.org/project/fors33-scanner/)
 [![PyPI](https://img.shields.io/pypi/v/fors33-scanner?style=flat-square)](https://pypi.org/project/fors33-scanner/)
-[![Docker Tag](https://img.shields.io/badge/docker-v0.9.1%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/fors33-scanner)
+[![Docker Tag](https://img.shields.io/badge/docker-v0.10.1%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/fors33-scanner)
 [![Docker Pulls](https://img.shields.io/docker/pulls/fors33/fors33-scanner?style=flat-square)](https://hub.docker.com/r/fors33/fors33-scanner)
 [![License](https://img.shields.io/github/license/fors33-official/fors33-scanner?style=flat-square)](https://github.com/fors33-official/fors33-scanner/blob/main/LICENSE)
 
@@ -11,12 +12,25 @@ High-speed file integrity and baseline scanner. Walks one or more roots, measure
 
 **Trust model:** The scanner is an O(1) discovery and liability mapping tool based on sidecar presence only. It does not validate Ed25519 signatures or cryptographic proof of baselines. For full cryptographic verification, use fors33-verifier.
 
-> **Legal:** Fors33 Scanner quantifies attestation coverage only. It does not establish, guarantee, or certify regulatory compliance. See [DISCLAIMER.md](DISCLAIMER.md) and [full legal terms at fors33.com/legal](https://fors33.com/legal).
+> **Legal:** Fors33 Scanner quantifies attestation coverage only. It does not establish, guarantee, or certify regulatory compliance. See [DISCLAIMER.md](DISCLAIMER.md) and [full legal terms at fors33.com/legal](https://fors33.com/legal). Report security issues privately: [SECURITY.md](SECURITY.md).
 
 For structured package context, see [LLM_CONTEXT.md](LLM_CONTEXT.md).
 
 <details>
 <summary><strong>Release notes &amp; version history</strong></summary>
+
+### v0.10.1 (2026-09-29)
+
+- **PATCH** `0.10.1` for a new PyPI upload after `0.10.0`. GitHub Release attaches CycloneDX plus uniquely named provenance and SBOM attestations.
+
+### v0.10.0 (2026-09-06)
+
+- **`hash_file_algos`**: one disk pass for multiple algorithms; `hash_file` stays the public single-algo wrapper.
+- **`execute_scan(..., include_sha256=False)`**: optional SHA-256 companion digest on baseline records when `algo` is not sha256. Default CLI output is unchanged.
+
+### v0.9.2 (2026-09-02)
+
+- **Packaging:** PyPI and Docker Hub short description use Fors33 Scanner file-integrity wording (not "liability scanner").
 
 ### v0.9.1 (2026-08-21)
 
@@ -55,7 +69,7 @@ For structured package context, see [LLM_CONTEXT.md](LLM_CONTEXT.md).
 ### 0.7.1 (2026-05-10)
 
 - **`has_sidecar` on unverified samples**: `ScanStats.add_unverified_sample(..., *, has_sidecar=False)` records `"has_sidecar": "true"` or `"false"` on each sampled unattested path (same shape as the L3dgr extension) for downstream re-seal UX.
-- **Supply chain**: Docker images from `publish-fors33-scanner` attach **SBOM** and **SLSA provenance** (`sbom: true`, `provenance: mode=max`). Pin by digest for regulated deployments.
+- **Supply chain**: Docker images from `publish-fors33-scanner` attach **SBOM** and **SLSA provenance** (`sbom: true`, `provenance: mode=max`). Pin by digest for regulated deployments. The `publish-pypi` GitHub Release also attaches a CycloneDX JSON SBOM of the wheel.
 
 ### 0.7.0 (2026-05-01)
 
@@ -71,7 +85,8 @@ For structured package context, see [LLM_CONTEXT.md](LLM_CONTEXT.md).
 
 ### Release model
 
-- Docker publish is **manual** via GitHub Actions **`workflow_dispatch`** with explicit **`version`** = `vX.Y.Z` (e.g. `v0.8.3`) and **`push_latest`**; bare `X.Y.Z` is **rejected**. It does **not** run automatically on git tags alone. PyPI releases use the same `vX.Y.Z` string in `pyproject.toml` (`python -m build`, `twine upload`).
+- Docker publish is **manual** via GitHub Actions workflow **`publish-fors33-scanner`** (`workflow_dispatch` with **`version`** = `vX.Y.Z` and **`push_latest`**). Bare `X.Y.Z` is **rejected**. It does **not** run automatically on git tags.
+- PyPI publish is **manual** via GitHub Actions workflow **`publish-pypi`** (`workflow_dispatch` with **`version`** = `vX.Y.Z`). The git tag `vX.Y.Z` must already exist on origin; the job checks out that tag and requires `pyproject.toml` `[project].version` to be the same number **without** the `v` prefix (PEP 440). Bare dispatch input `X.Y.Z` is **rejected**. It does **not** run automatically on git tags.
 
 </details>
 
@@ -171,7 +186,7 @@ Use **Fors33 Scanner** on the runner. No file uploads to Fors33. Inputs match `a
 
 ```yaml
 - name: Scan coverage
-  uses: fors33-official/fors33-scanner@v0.9.1
+  uses: fors33-official/fors33-scanner@v0.10.1
   with:
     root: .
     json: 'true'
@@ -233,9 +248,9 @@ Published images:
 - GHCR (Action image pin): `ghcr.io/fors33-official/fors33-scanner`
 
 ```bash
-docker run --rm ghcr.io/fors33-official/fors33-scanner:v0.9.1 --root /data --threshold-mb 1.0
+docker run --rm ghcr.io/fors33-official/fors33-scanner:v0.10.1 --root /data --threshold-mb 1.0
 # or
-docker run --rm docker.io/fors33/fors33-scanner:v0.9.1 --root /data --json
+docker run --rm docker.io/fors33/fors33-scanner:v0.10.1 --root /data --json
 ```
 
 Published images include **SBOM** and **build provenance** metadata (expand **Release notes & version history** near the top of this README). Pin a **version tag** or **immutable digest** in production pipelines.

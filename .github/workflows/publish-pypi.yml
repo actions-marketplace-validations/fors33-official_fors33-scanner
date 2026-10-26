@@ -1,0 +1,133 @@
+name: publish-pypi
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Git tag with leading v (example: v0.10.1). pyproject.toml is the same number without v. Bare X.Y.Z is rejected.'
+        required: true
+        type: string
+
+jobs:
+  pypi-publish:
+    name: Upload release to PyPI
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fors33-scanner
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+    steps:
+      - name: Set version
+        id: meta
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            echo "Version input is required."
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^v[0-9] ]]; then
+            echo "Version must be vX.Y.Z (leading v required). Got: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.meta.outputs.version }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Check pyproject version
+        env:
+          WANT_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          def bare(value: str) -> str:
+              text = value.strip()
+              if text[:1] in ("v", "V"):
+                  return text[1:]
+              return text
+
+          want = os.environ["WANT_VERSION"]
+          with open("pyproject.toml", "rb") as handle:
+              got = tomllib.load(handle)["project"]["version"]
+          if bare(got) != bare(want):
+              print(
+                  f"pyproject.toml version {got!r} does not match git tag {want!r} "
+                  f"(package version is X.Y.Z; tag is vX.Y.Z)",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"version ok: pyproject={got} tag={want}")
+          PY
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "build==1.6.1"
+          python -m build
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          syft-version: v1.51.1
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "Expected exactly one wheel in dist/; found ${#wheels[@]}."
+            exit 1
+          fi
+          syft scan "${wheels[0]}" -o cyclonedx-json=sbom/fors33-scanner.cdx.json
+          test -s sbom/fors33-scanner.cdx.json
+
+      - name: Attest SBOM
+        id: attest-sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+          sbom-path: sbom/fors33-scanner.cdx.json
+
+      - name: Attest
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp "${{ steps.attest.outputs.bundle-path }}" sbom/attestation-provenance.json
+          cp "${{ steps.attest-sbom.outputs.bundle-path }}" sbom/attestation-sbom.json
+          gh release create "${{ steps.meta.outputs.version }}" \
+            dist/*.whl dist/*.tar.gz \
+            sbom/fors33-scanner.cdx.json \
+            sbom/attestation-provenance.json \
+            sbom/attestation-sbom.json \
+            --title "${{ steps.meta.outputs.version }}" \
+            --notes "See CHANGELOG.md for this tag."

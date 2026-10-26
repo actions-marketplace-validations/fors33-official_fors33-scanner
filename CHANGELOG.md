@@ -2,6 +2,27 @@
 
 All notable changes to fors33-scanner are documented here.
 
+## [0.10.1] - 2026-09-29
+
+### Changed
+
+- **PATCH** package version `0.10.1` so Trusted Publisher can upload after `0.10.0` already on PyPI. Action and Docker pins are `:v0.10.1`.
+- **`pyproject.toml` version** is PEP 440 bare `X.Y.Z` (`0.10.1`). Git tags, `workflow_dispatch` `version`, Docker image tags, and GitHub Action pins stay `vX.Y.Z`.
+- **`publish-pypi` GitHub Release** attaches a CycloneDX JSON SBOM of the wheel (`sbom/fors33-scanner.cdx.json`, outside `dist/`) plus provenance and SBOM attestations copied as uniquely named `sbom/attestation-provenance.json` and `sbom/attestation-sbom.json`.
+
+## [v0.10.0] - 2026-09-06
+
+### Added
+
+- **`hash_file_algos`**: one disk pass updates every requested hasher; public `hash_file` remains a single-algo wrapper with the same signature.
+- **`execute_scan(..., include_sha256=False)`**: when true and `algo` is not sha256, baseline records gain `digest_sha256` (lowercase hex). Default CLI JSON, CSV, checksum, and jsonl output is unchanged. No CLI flag.
+
+## [v0.9.2] - 2026-09-02
+
+### Changed
+
+- PyPI / Docker Hub short description: **Fors33 Scanner** file-integrity wording (drops "liability scanner" product phrasing). Package stamps stay `v0.9.2` on Git, CHANGELOG, Action pin, and Docker tags.
+
 ## [v0.9.1] - 2026-08-21
 
 ### Added
